@@ -7,6 +7,7 @@ import random
 import requests
 import traceback
 import habitat_sim
+from datetime import datetime
 
 import pandas as pd
 import numpy as np
@@ -36,11 +37,13 @@ class Env:
         self.sim_cfg = cfg['sim_cfg']
         if self.cfg['name'] == 'default':
             self.cfg['name'] = f'default_{random.randint(0, 1000)}'
-        self._initialize_logging(cfg)
-        self._initialize_agent(cfg)
         self.outer_run_name = self.task + '_' + self.cfg['name']
+        self.run_timestamp = os.environ.get("WMNAV_RUN_TIMESTAMP") or datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.outer_run_name = f'{self.outer_run_name}_{self.run_timestamp}'
         self.inner_run_name = f'{self.cfg["instance"]}_of_{self.cfg["instances"]}'
         self.curr_run_name = "Not initialized"
+        self._initialize_logging(cfg)
+        self._initialize_agent(cfg)
         self.path_calculator = habitat_sim.MultiGoalShortestPath()
         self.simWrapper = None  # 修改self.simWrapper: SimWrapper = None
         self.num_episodes = 0
@@ -61,7 +64,7 @@ class Env:
         Args:
             cfg (dict): Configuration dictionary containing logging settings.
         """
-        self.log_file = os.path.join(os.environ.get("LOG_DIR"), f'{cfg["task"]}_{self.cfg["name"]}/{self.cfg["instance"]}_of_{self.cfg["instances"]}.txt')
+        self.log_file = os.path.join(os.environ.get("LOG_DIR"), f'{self.outer_run_name}/{self.cfg["instance"]}_of_{self.cfg["instances"]}.txt')
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
         if self.cfg['parallel']:
             logging.basicConfig(

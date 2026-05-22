@@ -21,6 +21,7 @@ PORT=2000
 QWEN_BASE_URL="http://127.0.0.1:8001/v1"
 QWEN_API_KEY="EMPTY"
 DETACH_AFTER_START=${DETACH_AFTER_START:-0}
+WMNAV_RUN_TIMESTAMP=${WMNAV_RUN_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}
 CMD="python scripts/main.py --config ${CFG} -ms ${MAX_STEPS_PER_EPISODE} -ne ${NUM_EPISODES_PER_INSTANCE} --name ${NAME} --instances ${INSTANCES} --parallel -lf ${LOG_FREQ} --port ${PORT} --dataset ${DATASET}"
 
 # Tmux Session Names
@@ -29,7 +30,7 @@ AGGREGATOR_SESSION="aggregator_${SESSION_NAME_PREFIX}"
 
 # Start Aggregator Session
 tmux new-session -d -s "$AGGREGATOR_SESSION" "bash --noprofile --norc"
-tmux send-keys -t "$AGGREGATOR_SESSION" "source ${CONDA_PATH} && conda activate ${VENV_NAME} && cd ${ROOT_DIR} && export QWEN_BASE_URL=${QWEN_BASE_URL} QWEN_API_KEY=${QWEN_API_KEY} && python scripts/aggregator.py --name ${TASK}_${NAME} --project ${PROJECT_NAME} --sleep ${SLEEP_INTERVAL} --config ${CFG} --port ${PORT}" C-m
+tmux send-keys -t "$AGGREGATOR_SESSION" "source ${CONDA_PATH} && conda activate ${VENV_NAME} && cd ${ROOT_DIR} && export QWEN_BASE_URL=${QWEN_BASE_URL} QWEN_API_KEY=${QWEN_API_KEY} WMNAV_RUN_TIMESTAMP=${WMNAV_RUN_TIMESTAMP} && python scripts/aggregator.py --name ${TASK}_${NAME} --project ${PROJECT_NAME} --sleep ${SLEEP_INTERVAL} --config ${CFG} --port ${PORT}" C-m
 SESSION_NAMES+=("$AGGREGATOR_SESSION")
 
 # Cleanup Function
@@ -55,7 +56,7 @@ for instance_id in $(seq 0 $((INSTANCES - 1))); do
   SESSION_NAME="${TASK}_${SESSION_NAME_PREFIX}_${instance_id}_of_${INSTANCES}"
 
   tmux new-session -d -s "$SESSION_NAME" "bash --noprofile --norc"
-  tmux send-keys -t "$SESSION_NAME" "source ${CONDA_PATH} && conda activate ${VENV_NAME} && cd ${ROOT_DIR} && export QWEN_BASE_URL=${QWEN_BASE_URL} QWEN_API_KEY=${QWEN_API_KEY} && CUDA_VISIBLE_DEVICES=$GPU_ID $CMD --instance $instance_id" C-m
+  tmux send-keys -t "$SESSION_NAME" "source ${CONDA_PATH} && conda activate ${VENV_NAME} && cd ${ROOT_DIR} && export QWEN_BASE_URL=${QWEN_BASE_URL} QWEN_API_KEY=${QWEN_API_KEY} WMNAV_RUN_TIMESTAMP=${WMNAV_RUN_TIMESTAMP} && CUDA_VISIBLE_DEVICES=$GPU_ID $CMD --instance $instance_id" C-m
   SESSION_NAMES+=("$SESSION_NAME")
 done
 
