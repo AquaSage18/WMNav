@@ -11,6 +11,15 @@ from simWrapper import PolarAction
 from utils import *
 from api import *
 
+
+class VLMResponseParseError(RuntimeError):
+    """Raised when a VLM response is not a valid final JSON object."""
+
+
+class VLMConsecutiveParseError(VLMResponseParseError):
+    """Raised after repeated consecutive VLM JSON parsing failures."""
+
+
 class Agent:
     def __init__(self, cfg: dict):
         pass
@@ -684,27 +693,171 @@ class VLMNavAgent(Agent):
     #     except (ValueError, SyntaxError):
     #         logging.error(f'Error parsing response {response}')
     #         return {}
+    def _extract_final_json(self, response: str) -> str:
+        """Extracts a JSON object from the final model answer only."""
+        if not isinstance(response, str) or not response.strip():
+            raise VLMResponseParseError("Empty final VLM answer; no JSON object to parse.")
+
+        text = response.strip()
+        if text.startswith("```") and text.endswith("```"):
+            lines = text.splitlines()
+            if len(lines) >= 3:
+                text = "\n".join(lines[1:-1]).strip()
+
+        if not text.startswith("{") or not text.endswith("}"):
+            raise VLMResponseParseError(
+                f"Final VLM answer must be exactly one JSON object, got: {response!r}"
+            )
+
+        return text
+
     def _eval_response(self, response: str):
-        """Converts the VLM response string into a dictionary, if possible"""
-        import re
-        result = re.sub(r"(?<=[a-zA-Z])'(?=[a-zA-Z])", "\\'", response)
+        """Parses the final answer JSON only. Reasoning text is not accepted."""
+        import json
+
+        json_text = self._extract_final_json(response)
         try:
-            eval_resp = ast.literal_eval(result[result.index('{') + 1:result.rindex('}')]) # {{}}
-            if isinstance(eval_resp, dict):
-                return eval_resp
-        except:
+            eval_resp = json.loads(json_text)
+        except json.JSONDecodeError as e:
+            raise VLMResponseParseError(
+                f"Failed to parse final JSON object: {e}. JSON candidate: {json_text!r}. Raw response: {response!r}"
+            ) from e
+
+        if not isinstance(eval_resp, dict):
+            raise VLMResponseParseError(
+                f"Final JSON must be an object, got {type(eval_resp).__name__}: {json_text!r}"
+            )
+        return eval_resp
+
+    def _record_parse_success(self):
+        self.parse_failure_count = 0
+        self.last_parse_failure = None
+
+    @staticmethod
+    def _is_truncated_debug(vlm_debug: dict) -> bool:
+        return bool(vlm_debug.get('truncated_by_max_tokens'))
+
+    def _vlm_logging_fields(self, prefix: str, prompt_type: str):
+        debug = getattr(self, 'vlm_debug_by_prompt', {}).get(prompt_type, {})
+        return {
+            f'{prefix}_FINISH_REASON': debug.get('finish_reason'),
+            f'{prefix}_TRUNCATED_BY_MAX_TOKENS': self._is_truncated_debug(debug),
+            f'{prefix}_REQUESTED_MAX_TOKENS': debug.get('requested_max_tokens'),
+            f'{prefix}_PROMPT_TOKENS': debug.get('prompt_tokens'),
+            f'{prefix}_COMPLETION_TOKENS': debug.get('completion_tokens'),
+            f'{prefix}_TOTAL_TOKENS': debug.get('total_tokens'),
+        }
+
+    def _record_parse_failure(self, prompt_type: str, prompt: str, response: str, error: Exception, reasoning: str=''):
+        vlm_debug = getattr(self, '_last_vlm_debug', {})
+        self.parse_failure_count += 1
+        self.last_parse_failure = {
+            'prompt_type': prompt_type,
+            'prompt': prompt,
+            'response': response,
+            'reasoning': reasoning,
+            'error': str(error),
+            'failure_count': self.parse_failure_count,
+            'vlm_debug': vlm_debug,
+        }
+        logging.error(
+            "VLM JSON parse failure %d/3 for %s: %s\nVLM DEBUG: %s\nPROMPT:\n%s\nFINAL RESPONSE:\n%s\nREASONING:\n%s",
+            self.parse_failure_count, prompt_type, error, vlm_debug, prompt, response, reasoning
+        )
+        if self.parse_failure_count >= 3:
+            raise VLMConsecutiveParseError(
+                f"VLM JSON parsing failed {self.parse_failure_count} consecutive times. "
+                f"Last prompt_type={prompt_type}, error={error}, response={response!r}"
+            ) from error
+
+    @staticmethod
+    def _json_schema_for_prompt(prompt_type: str):
+        if prompt_type == 'action':
+            return {
+                "type": "object",
+                "properties": {"action": {"type": "integer"}},
+                "required": ["action"],
+                "additionalProperties": False,
+            }
+        if prompt_type == 'goal':
+            return {
+                "type": "object",
+                "properties": {"Number": {"type": "integer"}},
+                "required": ["Number"],
+                "additionalProperties": False,
+            }
+        if prompt_type == 'planning':
+            return {
+                "type": "object",
+                "properties": {
+                    "Subtask": {"type": "string"},
+                    "Flag": {"type": "boolean"},
+                },
+                "required": ["Subtask", "Flag"],
+                "additionalProperties": False,
+            }
+        if prompt_type == 'stopping':
+            return {
+                "type": "object",
+                "properties": {"done": {"type": "integer", "enum": [0, 1]}},
+                "required": ["done"],
+                "additionalProperties": False,
+            }
+        if prompt_type == 'predicting':
+            angle_schema = {
+                "type": "object",
+                "properties": {
+                    "Score": {"type": "number", "minimum": 0, "maximum": 10},
+                    "Explanation": {"type": "string"},
+                },
+                "required": ["Score", "Explanation"],
+                "additionalProperties": False,
+            }
+            return {
+                "type": "object",
+                "properties": {angle: angle_schema for angle in ["30", "90", "150", "210", "270", "330"]},
+                "required": ["30", "90", "150", "210", "270", "330"],
+                "additionalProperties": False,
+            }
+        return None
+
+    def _call_vlm_json(self, vlm, images, prompt: str, prompt_type: str, call_chat: bool=False,
+                       max_attempts: int=3, validator=None):
+        last_error = None
+        last_response = ""
+        response_schema = self._json_schema_for_prompt(prompt_type)
+        use_response_schema = response_schema if getattr(vlm, 'supports_guided_json', False) else None
+        supports_response_schema = getattr(vlm, 'supports_guided_json', False)
+        for _ in range(max_attempts):
+            if call_chat and supports_response_schema:
+                response = vlm.call_chat(images, prompt, response_schema=use_response_schema)
+            elif call_chat:
+                response = vlm.call_chat(images, prompt)
+            elif supports_response_schema:
+                response = vlm.call(images, prompt, response_schema=use_response_schema)
+            else:
+                response = vlm.call(images, prompt)
+            self._last_vlm_debug = getattr(vlm, 'last_debug', {})
+            if not hasattr(self, 'vlm_debug_by_prompt'):
+                self.vlm_debug_by_prompt = {}
+            self.vlm_debug_by_prompt[prompt_type] = self._last_vlm_debug
+            last_response = response
             try:
-                eval_resp = ast.literal_eval(result[result.rindex('{'):result.rindex('}') + 1]) # {}
-                if isinstance(eval_resp, dict):
-                    return eval_resp
-            except:
-                try:
-                    eval_resp = ast.literal_eval(result[result.index('{'):result.rindex('}')+1]) # {{}, {}}
-                    if isinstance(eval_resp, dict):
-                        return eval_resp
-                except:
-                    logging.error(f'Error parsing response {response}')
-                    return {}
+                parsed = self._eval_response(response)
+                if validator is not None:
+                    validator(parsed)
+            except (VLMResponseParseError, KeyError, TypeError, ValueError) as e:
+                last_error = e
+                self._record_parse_failure(prompt_type, prompt, response, e, getattr(vlm, 'last_reasoning', ''))
+                continue
+
+            self._record_parse_success()
+            return parsed, response
+
+        raise VLMResponseParseError(
+            f"VLM JSON parsing failed after {max_attempts} attempts for {prompt_type}: {last_error}. "
+            f"Last response: {last_response!r}"
+        ) from last_error
 
 class WMNavAgent(VLMNavAgent):
     def reset(self):
@@ -719,6 +872,9 @@ class WMNavAgent(VLMNavAgent):
         self.step_ndx = 0
         self.init_pos = None
         self.turned = -self.cfg['turn_around_cooldown']
+        self.parse_failure_count = 0
+        self.last_parse_failure = None
+        self.vlm_debug_by_prompt = {}
         self.ActionVLM.reset()
         self.PlanVLM.reset()
         self.PredictVLM.reset()
@@ -1088,32 +1244,45 @@ class WMNavAgent(VLMNavAgent):
         if 'goal_image' in images:
             prompt_images.append(images['goal_image'])
 
-        response = self.ActionVLM.call_chat(prompt_images, action_prompt)
-
         logging_data = {}
         try:
-            response_dict = self._eval_response(response)
+            def validate_action(dct):
+                if 'action' not in dct:
+                    raise KeyError('action')
+                action = int(dct['action'])
+                if action < 0 or action > len(a_final):
+                    raise ValueError(f'action must be between 0 and {len(a_final)}, got {action}')
+
+            response_dict, response = self._call_vlm_json(
+                self.ActionVLM, prompt_images, action_prompt, 'action',
+                call_chat=True, validator=validate_action
+            )
             step_metadata['action_number'] = int(response_dict['action'])
-        except (IndexError, KeyError, TypeError, ValueError) as e:
+        except VLMResponseParseError as e:
             logging.error(f'Error parsing response {e}')
             step_metadata['success'] = 0
+            response = getattr(self, 'last_parse_failure', {}).get('response', '')
+            raise
         finally:
             logging_data['ACTION_NUMBER'] = step_metadata.get('action_number')
             logging_data['ACTION_PROMPT'] = action_prompt
             logging_data['ACTION_RESPONSE'] = response
+            logging_data.update(self._vlm_logging_fields('ACTION', 'action'))
 
         return step_metadata, logging_data, response
 
     def _goal_module(self, goal_image: np.array, a_goal, goal):
         """Determines if the agent should stop."""
         location_prompt = self._construct_prompt(goal, 'goal', num_actions=len(a_goal))
-        location_response = self.GoalVLM.call([goal_image], location_prompt)
-        dct = self._eval_response(location_response)
+        def validate_goal(dct):
+            if 'Number' not in dct:
+                raise KeyError('Number')
+            int(dct['Number'])
 
-        try:
-            number = int(dct['Number'])
-        except:
-            number = None
+        dct, location_response = self._call_vlm_json(
+            self.GoalVLM, [goal_image], location_prompt, 'goal', validator=validate_goal
+        )
+        number = int(dct['Number'])
 
         return number, location_response
 
@@ -1174,6 +1343,7 @@ class WMNavAgent(VLMNavAgent):
             agent_action = self._action_number_to_polar(step_metadata['action_number'], list(a_final))
         if a_goal is not None:
             logging_data['LOCATOR_RESPONSE'] = location_response
+            logging_data.update(self._vlm_logging_fields('LOCATOR', 'goal'))
         metadata = {
             'step_metadata': step_metadata,
             'logging_data': logging_data,
@@ -1183,42 +1353,47 @@ class WMNavAgent(VLMNavAgent):
         }
         return agent_action, metadata
 
-    def _eval_response(self, response: str):
-        """Converts the VLM response string into a dictionary, if possible"""
-        import re
-        result = re.sub(r"(?<=[a-zA-Z])'(?=[a-zA-Z])", "\\'", response)
-        try:
-            eval_resp = ast.literal_eval(result[result.index('{') + 1:result.rindex('}')]) # {{}}
-            if isinstance(eval_resp, dict):
-                return eval_resp
-        except:
-            try:
-                eval_resp = ast.literal_eval(result[result.rindex('{'):result.rindex('}') + 1]) # {}
-                if isinstance(eval_resp, dict):
-                    return eval_resp
-            except:
-                try:
-                    eval_resp = ast.literal_eval(result[result.index('{'):result.rindex('}')+1]) # {{}, {}}
-                    if isinstance(eval_resp, dict):
-                        return eval_resp
-                except:
-                    logging.error(f'Error parsing response {response}')
-                    return {}
-
     def _planning_module(self, planning_image: list[np.array], previous_subtask, goal_reason: str, goal):
         """Determines if the agent should stop."""
         planning_prompt = self._construct_prompt(goal, 'planning', previous_subtask, goal_reason)
-        planning_response = self.PlanVLM.call([planning_image], planning_prompt)
-        planning_response = planning_response.replace('false', 'False').replace('true', 'True')
-        dct = self._eval_response(planning_response)
+        def validate_planning(dct):
+            if 'Subtask' not in dct:
+                raise KeyError('Subtask')
+            if 'Flag' not in dct:
+                raise KeyError('Flag')
+            if not isinstance(dct['Flag'], bool):
+                raise TypeError('Flag must be a JSON boolean')
+
+        dct, _ = self._call_vlm_json(
+            self.PlanVLM, [planning_image], planning_prompt, 'planning',
+            validator=validate_planning
+        )
 
         return dct
 
     def _predicting_module(self, evaluator_image, goal):
         """Determines if the agent should stop."""
         evaluator_prompt = self._construct_prompt(goal, 'predicting')
-        evaluator_response = self.PredictVLM.call([evaluator_image], evaluator_prompt)
-        dct = self._eval_response(evaluator_response)
+        expected_angles = {'30', '90', '150', '210', '270', '330'}
+
+        def validate_predicting(dct):
+            missing = expected_angles.difference(dct)
+            if missing:
+                raise KeyError(f'missing angles: {sorted(missing)}')
+            for angle in expected_angles:
+                values = dct[angle]
+                if not isinstance(values, dict):
+                    raise TypeError(f'{angle} must be an object')
+                if 'Score' not in values or 'Explanation' not in values:
+                    raise KeyError(f'{angle} must contain Score and Explanation')
+                score = values['Score']
+                if not isinstance(score, (int, float)) or not 0 <= score <= 10:
+                    raise ValueError(f'{angle}.Score must be a number from 0 to 10')
+
+        dct, _ = self._call_vlm_json(
+            self.PredictVLM, [evaluator_image], evaluator_prompt, 'predicting',
+            validator=validate_predicting
+        )
 
         return dct
 
@@ -1330,35 +1505,30 @@ class WMNavAgent(VLMNavAgent):
 
     def make_plan(self, pano_images, previous_subtask, goal_reason, goal):
         response = self._planning_module(pano_images, previous_subtask, goal_reason, goal)
-
-        try:
-            goal_flag, subtask = response['Flag'], response['Subtask']
-        except:
-            print("planning failed!")
-            print('response:', response)
-            goal_flag, subtask = False, '{}'
-
-        return goal_flag, subtask
+        return response['Flag'], response['Subtask']
 
     def _construct_prompt(self, goal: str, prompt_type:str, subtask: str='{}', reason: str='{}', num_actions: int=0):
+        json_only = (
+            "Final answer rules: output exactly one valid JSON object. "
+            "Do not output markdown, code fences, bullet points, explanations, or any text before or after the JSON. "
+            "The final answer must start with { and end with }. Keep any internal reasoning concise. "
+            "Use double quotes for all JSON keys and string values. Use true/false for booleans."
+        )
         if prompt_type == 'goal':
             location_prompt = (f"The agent has been tasked with navigating to a {goal.upper()}. The agent has sent you an image taken from its current location. "
             f"There are {num_actions} red arrows superimposed onto your observation, which represent potential positions. " 
             f"These are labeled with a number in a white circle, which represent the location you can move to. "
-            f"First, tell me whether the {goal} is in the image, and make sure the object you see is ACTUALLY a {goal}, return number 0 if if there is no {goal}, or if you are not sure. Note a chair must have a backrest and a chair is not a stool. Note a chair is NOT sofa(couch) which is NOT a bed. "
-            f'Second, if there is {goal} in the image, then determine which circle best represents the location of the {goal}(close enough to the target. If a person is standing in that position, they can easily touch the {goal}), and give the number and a reason. '
-            f'If none of the circles represent the position of the {goal}, return number 0, and give a reason why you returned 0. '
-            "Format your answer in the json {{'Number': <The number you choose>}}")
+            f"Determine whether the {goal} is in the image, and make sure the object you see is ACTUALLY a {goal}. Return 0 if there is no {goal}, or if you are not sure. Note a chair must have a backrest and a chair is not a stool. Note a chair is NOT sofa(couch) which is NOT a bed. "
+            f'If there is {goal} in the image, determine which circle best represents the location of the {goal}. If none of the circles represent the position of the {goal}, return 0. '
+            f'{json_only} Required JSON schema: {{"Number": <integer action number, 0 if no valid target circle>}}')
             return location_prompt
         if prompt_type == 'predicting':
             evaluator_prompt = (f"The agent has been tasked with navigating to a {goal.upper()}. The agent has sent you the panoramic image describing your surrounding environment, each image contains a label indicating the relative rotation angle(30, 90, 150, 210, 270, 330) with red fonts. "
             f'Your job is to assign a score to each direction (ranging from 0 to 10), judging whether this direction is worth exploring. The following criteria should be used: '
-            f'To help you describe the layout of your surrounding,  please follow my step-by-step instructions: '
             f'(1) If there is no visible way to move to other areas and it is clear that the target is not in sight, assign a score of 0. Note a chair must have a backrest and a chair is not a stool. Note a chair is NOT sofa(couch) which is NOT a bed. '
             f'(2) If the {goal} is found, assign a score of 10.  ' 
             f'(3) If there is a way to move to another area, assign a score based on your estimate of the likelihood of finding a {goal}, using your common sense. Moving to another area means there is a turn in the corner, an open door, a hallway, etc. Note you CANNOT GO THROUGH CLOSED DOORS. CLOSED DOORS and GOING UP OR DOWN STAIRS are not considered. '
-            "For each direction, provide an explanation for your assigned score. Format your answer in the json {'30': {'Score': <The score(from 0 to 10) of angle 30>, 'Explanation': <An explanation for your assigned score.>}, '90': {...}, '150': {...}, '210': {...}, '270': {...}, '330': {...}}. "
-            "Answer Example: {'30': {'Score': 0, 'Explanation': 'Dead end with a recliner. No sign of a bed or any other room.'}, '90': {'Score': 2, 'Explanation': 'Dining area. It is possible there is a doorway leading to other rooms, but bedrooms are less likely to be directly adjacent to dining areas.'}, ..., '330': {'Score': 2, 'Explanation': 'Living room area with a recliner.  Similar to 270, there is a possibility of other rooms, but no strong indication of a bedroom.'}}")
+            f'{json_only} Required JSON schema: {{"30": {{"Score": <number 0-10>, "Explanation": <short string>}}, "90": {{"Score": <number 0-10>, "Explanation": <short string>}}, "150": {{"Score": <number 0-10>, "Explanation": <short string>}}, "210": {{"Score": <number 0-10>, "Explanation": <short string>}}, "270": {{"Score": <number 0-10>, "Explanation": <short string>}}, "330": {{"Score": <number 0-10>, "Explanation": <short string>}}}}')
             return evaluator_prompt
         if prompt_type == 'planning':
             if reason != '' and subtask != '{}':
@@ -1370,34 +1540,42 @@ class WMNavAgent(VLMNavAgent):
                 f'(1) If the {goal} appears in the image, directly choose the target as the next step in the plan. Note a chair must have a backrest and a chair is not a stool. Note a chair is NOT sofa(couch) which is NOT a bed. '
                 f'(2) If the {goal} is not found and the previous subtask {subtask} has not completed, continue to complete the last subtask {subtask} that has not been completed.'
                 f'(3) If the {goal} is not found and the previous subtask {subtask} has already been completed. Identify a new subtask by describing where you are going next to be more likely to find clues to the the {goal} and think about whether the {goal} is likely to occur in that direction. Note you need to pay special attention to open doors and hallways, as they can lead to other unseen rooms. Note GOING UP OR DOWN STAIRS is an option. '
-                "Format your answer in the json {{'Subtask': <Where you are going next>, 'Flag': <Whether the target is in your view, True or False>}}. "
-                "Answer Example: {{'Subtask': 'Go to the hallway', 'Flag': False}} or {{'Subtask': "+f"'Go to the {goal}'"+", 'Flag': True}} or {{'Subtask': 'Go to the open door', 'Flag': True}}")
+                f'{json_only} Required JSON schema: {{"Subtask": <short string naming the next place to go>, "Flag": <boolean, true only if the target is visible in the current view>}}')
             else:
                 planning_prompt = (f"The agent has been tasked with navigating to a {goal.upper()}. The agent has sent you an image taken from its current location."
                 f'Your job is to describe next place to go. '
                 f'To help you plan your best next step, I can give you some human suggestions:. '
                 f'(1) If the {goal} appears in the image, directly choose the target as the next step in the plan. Note a chair must have a backrest and a chair is not a stool. Note a chair is NOT sofa(couch) which is NOT a bed. '
                 f'(2) If the {goal} is not found, describe where you are going next to be more likely to find clues to the the {goal} and analyze the room type and think about whether the {goal} is likely to occur in that direction. Note you need to pay special attention to open doors and hallways, as they can lead to other unseen rooms. Note GOING UP OR DOWN STAIRS is an option. '
-                "Format your answer in the json {{'Subtask': <Where you are going next>, 'Flag': <Whether the target is in your view, True or False>}}. "
-                "Answer Example: {{'Subtask': 'Go to the hallway', 'Flag': False}} or {{'Subtask': "+f"'Go to the {goal}'"+", 'Flag': True}} or {{'Subtask': 'Go to the open door', 'Flag': True}}")
+                f'{json_only} Required JSON schema: {{"Subtask": <short string naming the next place to go>, "Flag": <boolean, true only if the target is visible in the current view>}}')
             return planning_prompt
+        if prompt_type == 'stopping':
+            stopping_prompt = (
+                f"The agent has been tasked with navigating to a {goal.upper()}. The agent has sent you an image taken from its current location. "
+                f"Return done=1 only if the agent is very close to an actual {goal}; otherwise return done=0. "
+                f"Note a chair is NOT sofa(couch) which is NOT a bed. {json_only} "
+                'Required JSON schema: {"done": <integer 0 or 1>}'
+            )
+            return stopping_prompt
         if prompt_type == 'action':
             if subtask != '{}':
                 action_prompt = (
                 f"TASK: {subtask}. Your final task is to NAVIGATE TO THE NEAREST {goal.upper()}, and get as close to it as possible. "
                 f"There are {num_actions - 1} red arrows superimposed onto your observation, which represent potential actions. " 
                 f"These are labeled with a number in a white circle, which represent the location you would move to if you took that action. {'NOTE: choose action 0 if you want to TURN AROUND or DONT SEE ANY GOOD ACTIONS. ' if self.step_ndx - self.turned >= self.cfg['turn_around_cooldown'] else ''}"
-                f"In order to complete the subtask {subtask} and eventually the final task NAVIGATING TO THE NEAREST {goal.upper()}. Explain which action acheives that best. "
-                "Return your answer as {{'action': <action_key>}}. Note you CANNOT GO THROUGH CLOSED DOORS, and you DO NOT NEED TO GO UP OR DOWN STAIRS"
+                f"In order to complete the subtask {subtask} and eventually the final task NAVIGATING TO THE NEAREST {goal.upper()}, choose the best action key. "
+                f"Note you CANNOT GO THROUGH CLOSED DOORS, and you DO NOT NEED TO GO UP OR DOWN STAIRS. {json_only} "
+                'Required JSON schema: {"action": <integer action key>}'
                 )
             else:
                 action_prompt = (
                     f"TASK: NAVIGATE TO THE NEAREST {goal.upper()}, and get as close to it as possible. Use your prior knowledge about where items are typically located within a home. "
                     f"There are {num_actions - 1} red arrows superimposed onto your observation, which represent potential actions. "
                     f"These are labeled with a number in a white circle, which represent the location you would move to if you took that action. {'NOTE: choose action 0 if you want to TURN AROUND or DONT SEE ANY GOOD ACTIONS. ' if self.step_ndx - self.turned >= self.cfg['turn_around_cooldown'] else ''}"
-                    f"First, tell me what you see in your sensor observation, and if you have any leads on finding the {goal.upper()}. Second, tell me which general direction you should go in. "
-                    "Lastly, explain which action acheives that best, and return it as {{'action': <action_key>}}. Note you CANNOT GO THROUGH CLOSED DOORS, and you DO NOT NEED TO GO UP OR DOWN STAIRS"
+                    f"Choose the action key that best moves toward likely locations for the nearest {goal.upper()}. "
+                    f"Note you CANNOT GO THROUGH CLOSED DOORS, and you DO NOT NEED TO GO UP OR DOWN STAIRS. {json_only} "
+                    'Required JSON schema: {"action": <integer action key>}'
                 )
             return action_prompt
 
-        raise ValueError('Prompt type must be goal, predicting, planning, or action')
+        raise ValueError('Prompt type must be goal, predicting, planning, stopping, or action')

@@ -126,6 +126,13 @@ class Env:
                     break
                 obs = self.simWrapper.step(agent_action)  # 执行操作，更新agent的状态和观察
 
+            except VLMConsecutiveParseError as e:
+                logging.error("Terminating episode after consecutive VLM parse failures: %s", e)
+                last_failure = getattr(self.agent, 'last_parse_failure', None)
+                if last_failure is not None:
+                    logging.error("Last VLM parse failure detail: %s", last_failure)
+                break
+
             except Exception as e:
                 log_exception(e)
 
@@ -392,6 +399,9 @@ class WMNavEnv(Env):
         step_metadata = metadata['step_metadata']
         metadata['logging_data']['EVALUATOR_RESPONSE'] = str({'goal_rotate':goal_rotate*30, 'explorable_value': explorable_value, 'reason': reason})
         metadata['logging_data']['PLANNING_RESPONSE'] = str({'goal_flag': goal_flag, 'subtask': subtask})
+        if hasattr(self.agent, '_vlm_logging_fields'):
+            metadata['logging_data'].update(self.agent._vlm_logging_fields('EVALUATOR', 'predicting'))
+            metadata['logging_data'].update(self.agent._vlm_logging_fields('PLANNING', 'planning'))
         logging_data = metadata['logging_data']
 
         images = metadata['images']

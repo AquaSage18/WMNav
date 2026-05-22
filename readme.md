@@ -33,6 +33,7 @@ This project is based on <a href="https://github.com/Jirl-upenn/VLMnav">VLMnav</
 ## 🔥 News
 * **` June. 16th, 2025`:** WMNav is accepted to IROS 2025 and selected as </strong>oral presentation</strong>.
 * **` June. 11th, 2025`:** WMNav NOW supports the open-source model Qwen2.5-VL!
+* **` May. 21st, 2026`:** WMNav now supports Qwen3.6 thinking mode for local inference.
 * **` Mar. 14th, 2025`:** The code of WMNav is available! ☕️
 * **` Mar. 4th, 2025`:** We released our paper on [Arxiv](https://arxiv.org/abs/2503.02247).
 
@@ -118,25 +119,26 @@ You can choose the VLM type in [YAML file](config/WMNav.yaml):
 agent_cfg:
   ...
   vlm_cfg:
-    model_cls: GeminiVLM # [GeminiVLM, QwenVLM]
+    model_cls: QwenVLM # [GeminiVLM, QwenVLM]
     model_kwargs:
-      model: gemini-2.0-flash # [gemini-1.5-flash, gemini-1.5-pro, gemini-2.0-flash, Qwen/Qwen2.5-VL-3B-Instruct, Qwen/Qwen2.5-VL-7B-Instruct]
+      model: /data/pretrained_models/Qwen/Qwen3.6-27B # [gemini-2.0-flash, Qwen/Qwen3.6-27B]
+      enable_thinking: true
 ```
 
 1. **Gemini**
 To use the Gemini VLMs, paste a base url and api key into the [.env file](.env) for the variable called GEMINI_BASE_URL and GEMINI_API_KEY.
 
 2. **Qwen**
-To use the Qwen VLMs, refer to [Qwen2.5-VL](https://github.com/QwenLM/Qwen2.5-VL). We use vLLM for fast Qwen2.5-VL deployment and inference. You need to install vllm>0.7.2 to enable Qwen2.5-VL support.
+To use the Qwen VLMs, refer to [Qwen3](https://github.com/QwenLM/Qwen3). We use vLLM for fast Qwen3.6 deployment and inference. You need to install vllm>=0.9.0 to enable Qwen3 reasoning support with the qwen3 parser.
     ```
     pip install git+https://github.com/huggingface/transformers@f3f6c86582611976e72be054675e2bf0abb5f775
     pip install accelerate
     pip install qwen-vl-utils
-    pip install 'vllm>0.7.2'
+    pip install 'vllm>=0.9.0'
     ```
     Run the command below to start an OpenAI-compatible API service:
     ```
-    vllm serve Qwen/Qwen2.5-VL-7B-Instruct --port 8000 --host 0.0.0.0 --dtype bfloat16 --limit-mm-per-prompt image=5,video=5
+    vllm serve /data/pretrained_models/Qwen/Qwen3.6-27B --port 8000 --host 0.0.0.0 --dtype bfloat16 --limit-mm-per-prompt image=5,video=5 --reasoning-parser qwen3
     ```
 
     Then set the variables in the [.env file](.env) as following:

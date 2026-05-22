@@ -1,7 +1,15 @@
 import argparse
 import yaml
+import os
+import sys
 
 from dotenv import load_dotenv
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC_DIR = os.path.join(PROJECT_ROOT, "src")
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
 from api import *
 from WMNav_agent import *
 from WMNav_env import *

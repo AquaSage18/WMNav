@@ -4,8 +4,16 @@ import time
 import argparse
 import wandb
 import yaml
+import os
+import sys
 
 from flask import Flask, request, jsonify
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC_DIR = os.path.join(PROJECT_ROOT, "src")
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
 from utils import *
 
 # Initialize Flask app
